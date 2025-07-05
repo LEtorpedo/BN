@@ -1,0 +1,24 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+VENV/
+
+# Application Data - IMPORTANT!
+# Do not commit user-uploaded data, results, or logs.
+calcium_app/uploads/*
+calcium_app/results/*
+calcium_app/logs/*
+
+# OS-specific files
+.DS_Store
+Thumbs.db 
