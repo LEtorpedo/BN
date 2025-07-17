@@ -3,6 +3,7 @@ import pandas as pd
 from scipy import signal
 from scipy.signal import find_peaks, peak_widths
 from scipy.integrate import trapezoid
+from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 import os
 
@@ -12,12 +13,14 @@ def detect_calcium_transients(data, fs=4.8, params=None):
     """
     Detects calcium transients in calcium imaging data.
     All parameters are passed via the 'params' dictionary.
+    This version uses derivative for start point and exponential fit for end point.
     """
     default_params = {
         'min_snr': 3.5, 'min_duration': 12, 'smooth_window': 31, 'peak_distance': 24,
         'baseline_percentile': 8, 'max_duration': 800, 'detect_subpeaks': False,
         'subpeak_prominence': 0.15, 'subpeak_width': 5, 'subpeak_distance': 8,
-        'min_morphology_score': 0.20, 'min_exp_decay_score': 0.12, 'filter_strength': 1.0
+        'min_morphology_score': 0.20, 'min_exp_decay_score': 0.12, 'filter_strength': 1.0,
+        'start_deriv_threshold_sd': 4.0, 'end_exp_fit_factor_m': 3.5
     }
     if params is None:
         params = {}
@@ -29,22 +32,8 @@ def detect_calcium_transients(data, fs=4.8, params=None):
     p = run_params
     min_snr, min_duration, smooth_window, peak_distance = p['min_snr'], p['min_duration'], p['smooth_window'], p['peak_distance']
     baseline_percentile, max_duration, filter_strength = p['baseline_percentile'], p['max_duration'], p['filter_strength']
-    min_morphology_score, min_exp_decay_score = p['min_morphology_score'], p['min_exp_decay_score']
-    detect_subpeaks, subpeak_prominence, subpeak_width, subpeak_distance = p['detect_subpeaks'], p['subpeak_prominence'], p['subpeak_width'], p['subpeak_distance']
+    start_deriv_threshold_sd, end_exp_fit_factor_m = p['start_deriv_threshold_sd'], p['end_exp_fit_factor_m']
 
-    if filter_strength != 1.0:
-        min_snr *= filter_strength
-        min_morphology_score = min(0.9, min_morphology_score * filter_strength)
-        min_exp_decay_score = min(0.9, min_exp_decay_score * filter_strength)
-        if filter_strength > 1.0:
-            min_duration = int(min_duration * (1 + (filter_strength - 1) * 0.5))
-            smooth_window = int(smooth_window * (1 + (filter_strength - 1) * 0.3))
-            peak_distance = int(peak_distance * (1 + (filter_strength - 1) * 0.2))
-        else:
-            min_duration = max(10, int(min_duration * filter_strength))
-            smooth_window = max(21, int(smooth_window * (1 - (1 - filter_strength) * 0.3)))
-            peak_distance = max(10, int(peak_distance * filter_strength))
-    
     if smooth_window > 1 and smooth_window % 2 == 0:
         smooth_window += 1
     smoothed_data = signal.savgol_filter(data, smooth_window, 3) if smooth_window > 1 else data.copy()
@@ -52,42 +41,90 @@ def detect_calcium_transients(data, fs=4.8, params=None):
     baseline = np.percentile(smoothed_data, baseline_percentile)
     noise_level = np.std(smoothed_data[smoothed_data < np.percentile(smoothed_data, 50)])
     if noise_level == 0:
-        noise_level = 1e-9 # Avoid division by zero
-        
+        noise_level = 1e-9
+
+    # --- Start point detection setup ---
+    dF_dt = np.gradient(smoothed_data)
+    baseline_deriv_mask = smoothed_data < np.percentile(smoothed_data, 50)
+    baseline_derivative = dF_dt[baseline_deriv_mask]
+    deriv_mean = np.mean(baseline_derivative)
+    deriv_std = np.std(baseline_derivative)
+    deriv_threshold = deriv_mean + start_deriv_threshold_sd * deriv_std
+
+    # --- Peak detection ---
     threshold = baseline + min_snr * noise_level
-    
     prominence_threshold = noise_level * 1.2 * filter_strength
     min_width_frames = min_duration // 6
-    
     peaks, peak_props = find_peaks(smoothed_data, height=threshold, prominence=prominence_threshold, width=min_width_frames, distance=peak_distance)
     
     if len(peaks) == 0:
         return [], smoothed_data
-        
-    widths_info = peak_widths(smoothed_data, peaks, rel_height=0.5)
-    fwhms = widths_info[0]
 
-    transients = []
-    for i, peak in enumerate(peaks):
-        start_time = int(widths_info[2][i])
-        end_time = int(widths_info[3][i])
-        duration_frames = end_time - start_time
+    # --- End point detection setup ---
+    def exp_decay(t, A, tau, C):
+        return A * np.exp(-t / tau) + C
         
+    transients = []
+    for i, peak_idx in enumerate(peaks):
+        # --- New start point detection ---
+        start_idx = peak_idx
+        left_limit = 0 if i == 0 else peaks[i-1]
+        while start_idx > left_limit:
+            if dF_dt[start_idx] < deriv_threshold:
+                break
+            start_idx -= 1
+        
+        # --- New end point detection ---
+        prelim_end_idx = peak_idx
+        right_limit = len(smoothed_data) - 1 if i == len(peaks) - 1 else peaks[i+1]
+        while prelim_end_idx < right_limit and smoothed_data[prelim_end_idx] > baseline:
+            prelim_end_idx += 1
+        
+        end_idx = prelim_end_idx
+        decay_data = smoothed_data[peak_idx:prelim_end_idx]
+        if len(decay_data) > 3:
+            t_decay = np.arange(len(decay_data))
+            try:
+                initial_A = smoothed_data[peak_idx] - baseline
+                initial_tau = max(1.0, len(decay_data) / 2)
+                initial_C = baseline
+                popt, _ = curve_fit(
+                    exp_decay, t_decay, decay_data, 
+                    p0=(initial_A, initial_tau, initial_C),
+                    maxfev=5000,
+                    bounds=([0, 1e-9, -np.inf], [np.inf, np.inf, np.inf])
+                )
+                A_fit, tau_fit, C_fit = popt
+                if 0 < tau_fit < len(data):
+                    calculated_end_idx = peak_idx + int(end_exp_fit_factor_m * tau_fit)
+                    end_idx = min(calculated_end_idx, right_limit, len(smoothed_data) - 1)
+            except (RuntimeError, ValueError):
+                pass
+        
+        # Final checks on boundaries
+        if i < len(peaks) - 1 and end_idx >= peaks[i+1]:
+            end_idx = peak_idx + np.argmin(smoothed_data[peak_idx:peaks[i+1]])
+        if i > 0 and start_idx <= peaks[i-1]:
+            start_idx = peaks[i-1] + np.argmin(smoothed_data[peaks[i-1]:peak_idx])
+
+        duration_frames = end_idx - start_idx
         if not (min_duration <= duration_frames <= max_duration):
             continue
-        
-        amplitude = smoothed_data[peak] - baseline
-        
+            
+        # Feature calculation
+        amplitude = smoothed_data[peak_idx] - baseline
+        widths_info = peak_widths(smoothed_data, [peak_idx], rel_height=0.5)
+
         transients.append({
-            'start': start_time, 
-            'peak': peak, 
-            'end': end_time, 
+            'start': start_idx, 
+            'peak': peak_idx, 
+            'end': end_idx, 
             'amplitude': amplitude,
             'duration': duration_frames / fs,
-            'fwhm': fwhms[i] / fs,
-            'rise_time': (peak - start_time) / fs,
-            'decay_time': (end_time - peak) / fs,
-            'auc': trapezoid(smoothed_data[start_time:end_time] - baseline, dx=1/fs),
+            'fwhm': widths_info[0][0] / fs if len(widths_info[0]) > 0 else np.nan,
+            'rise_time': (peak_idx - start_idx) / fs,
+            'decay_time': (end_idx - peak_idx) / fs,
+            'auc': trapezoid(smoothed_data[start_idx:end_idx] - baseline, dx=1/fs),
             'snr': amplitude / noise_level
         })
         
